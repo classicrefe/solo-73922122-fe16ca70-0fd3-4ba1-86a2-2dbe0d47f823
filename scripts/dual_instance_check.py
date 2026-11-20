@@ -126,6 +126,18 @@ def get_bytes(port: int, path: str):
         return r.status, r.read()
 
 
+def post_json(port: int, path: str, payload: dict):
+    body = json.dumps(payload).encode()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    conn.request(
+        "POST", path, body=body, headers={"Content-Type": "application/json"}
+    )
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode())
+    conn.close()
+    return resp.status, data
+
+
 def main() -> int:
     data_dir = tempfile.mkdtemp(prefix="wq-dual-")
     print(f"[setup] 共享 DATA_DIR={data_dir}")
@@ -238,6 +250,57 @@ def main() -> int:
         finally:
             # 无法 kill：改为脱离进程（它绑定临时目录，会话结束后随环境回收）。
             print(f"[note] 环境禁止 kill 信号，第三实例保留运行，端口 {PORT_C}")
+
+        # 6) 统计包跨实例：A 制包 -> B 查询 -> B 合并 -> A 查询合并结果。
+        stat_csv_1 = b"station,ph,conductivity_us_cm\nS1,6.5,130\nS2,7.0,140\n"
+        stat_csv_2 = b"station,ph,conductivity_us_cm\nS3,7.5,150\nS4,8.0,160\n"
+        s1, p1 = post_release(PORT_A, "STS1", "2026-11-18", "ORD-STAT-1", stat_csv_1)
+        s2, p2 = post_release(PORT_B, "STS2", "2026-11-18", "ORD-STAT-2", stat_csv_2)
+        rid1, rid2 = p1["release"]["id"], p2["release"]["id"]
+        check(s1 == 201 and s2 == 201, "两实例各发布一件统计用 CSV")
+        status_pkg, pkg = post_json(PORT_A, "/stat-packages", {"release_ids": [rid1]})
+        check(
+            status_pkg == 201 and pkg["release_ids"] == [rid1] and pkg["row_count"] == 2,
+            f"实例 A 制包成功（包号 {pkg.get('package_id')}）",
+        )
+        status_get, pkg_seen_b = get_json(
+            PORT_B, f"/stat-packages/{pkg['package_id']}"
+        )
+        check(
+            status_get == 200 and pkg_seen_b == pkg,
+            "实例 B 按包号查询到实例 A 刚制的包（跨实例可见）",
+        )
+        status_pkg2, pkg2 = post_json(
+            PORT_B, "/stat-packages", {"release_ids": [rid1, rid2]}
+        )
+        status_merge, merged = post_json(
+            PORT_B,
+            "/stat-packages/merge",
+            {"package_ids": [pkg["package_id"], pkg2["package_id"]]},
+        )
+        check(
+            status_pkg2 == 201
+            and status_merge == 201
+            and merged["release_ids"] == sorted([rid1, rid2])
+            and merged["row_count"] == 4,
+            "实例 B 合并两包：同一发布序号只计一次",
+        )
+        status_get2, merged_seen_a = get_json(
+            PORT_A, f"/stat-packages/{merged['package_id']}"
+        )
+        check(
+            status_get2 == 200
+            and merged_seen_a == merged
+            and merged["pearson_r"] is not None
+            and abs(merged["pearson_r"] - 1.0) < 1e-9,
+            "实例 A 查询到合并包，Pearson 系数与直接统计一致（完全线性）",
+        )
+        # 第三实例（重启视角）同样能查到全部统计包。
+        _, pkgs_c = get_json(PORT_C, "/stat-packages")
+        check(
+            any(p["package_id"] == merged["package_id"] for p in pkgs_c),
+            "重启视角实例列出全部统计包（含合并包）",
+        )
 
     finally:
         for proc in (proc_a, proc_b):

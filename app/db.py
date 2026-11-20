@@ -18,6 +18,7 @@ from typing import Iterator, Sequence
 
 from . import merkle
 from .config import Settings
+from .stats import ReleaseStats
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS releases (
@@ -40,6 +41,24 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE TABLE IF NOT EXISTS meta (
     key    TEXT PRIMARY KEY,
     value  TEXT NOT NULL
+);
+
+-- 统计包：只存充分统计量（整数定标的十进制字符串），不存逐行读数。
+CREATE TABLE IF NOT EXISTS stat_packages (
+    id          INTEGER PRIMARY KEY,            -- 包号，1 起稠密
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stat_package_items (
+    package_id  INTEGER NOT NULL REFERENCES stat_packages(id),
+    release_id  INTEGER NOT NULL,               -- 发布序号（合并时按它去重）
+    n           INTEGER NOT NULL,               -- 该序号内两列均有值的行数
+    sx          TEXT NOT NULL,                  -- 以下五项为 1e6 定标整数和
+    sy          TEXT NOT NULL,
+    sxx         TEXT NOT NULL,
+    syy         TEXT NOT NULL,
+    sxy         TEXT NOT NULL,
+    PRIMARY KEY (package_id, release_id)
 );
 """
 
@@ -256,6 +275,91 @@ class Database:
                 "SELECT * FROM checkpoints ORDER BY seq ASC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # 统计包
+    # ------------------------------------------------------------------ #
+    def create_stat_package(self, items: list[tuple[int, ReleaseStats]]) -> dict:
+        """串行化落库一个统计包。``items`` 为 (发布序号, 充分统计量)，须已去重。
+
+        制包/合并共用一个写入入口：调用方负责读原件或读既有包并算好
+        统计量，本方法只保证原子落库（整次失败不留半个包）。
+        """
+        for attempt in range(3):
+            try:
+                return self._create_stat_package_once(items)
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempt < 2:
+                    time.sleep(0.2 * (attempt + 1))
+                    continue
+                raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def _create_stat_package_once(
+        self, items: list[tuple[int, ReleaseStats]]
+    ) -> dict:
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = conn.execute(
+                    "INSERT INTO stat_packages(created_at) VALUES (?)",
+                    (_utcnow(),),
+                )
+                package_id = cursor.lastrowid
+                conn.executemany(
+                    "INSERT INTO stat_package_items("
+                    "package_id, release_id, n, sx, sy, sxx, syy, sxy"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (package_id, release_id, *stats.as_row())
+                        for release_id, stats in items
+                    ],
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        package = self.get_stat_package(package_id)
+        assert package is not None
+        return package
+
+    @staticmethod
+    def _stat_package_locked(conn: sqlite3.Connection, package_id: int):
+        head = conn.execute(
+            "SELECT id, created_at FROM stat_packages WHERE id = ?",
+            (package_id,),
+        ).fetchone()
+        if head is None:
+            return None
+        rows = conn.execute(
+            "SELECT release_id, n, sx, sy, sxx, syy, sxy "
+            "FROM stat_package_items WHERE package_id = ? ORDER BY release_id",
+            (package_id,),
+        ).fetchall()
+        return {
+            "id": head["id"],
+            "created_at": head["created_at"],
+            "items": {r["release_id"]: ReleaseStats.from_row(r) for r in rows},
+        }
+
+    def get_stat_package(self, package_id: int) -> dict | None:
+        """按包号取统计包（含逐发布序号的充分统计量），不存在返回 None。"""
+        with self.connect() as conn:
+            return self._stat_package_locked(conn, package_id)
+
+    def list_stat_packages(self) -> list[dict]:
+        """全部统计包，按包号升序。"""
+        with self.connect() as conn:
+            heads = conn.execute(
+                "SELECT id FROM stat_packages ORDER BY id ASC"
+            ).fetchall()
+            return [
+                pkg
+                for pkg in (
+                    self._stat_package_locked(conn, row["id"]) for row in heads
+                )
+                if pkg is not None
+            ]
 
     # ------------------------------------------------------------------ #
     # 启动自检：不得带着缺件记录对外服务

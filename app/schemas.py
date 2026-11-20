@@ -1,7 +1,7 @@
 """HTTP 响应模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 
 
 class ReleaseOut(BaseModel):
@@ -60,6 +60,33 @@ class HealthOut(BaseModel):
     status: str
     release_count: int
     problems: list[str]
+
+
+class StatPackageCreateIn(BaseModel):
+    release_ids: list[PositiveInt] = Field(
+        ...,
+        min_length=1,
+        description="参与制包的发布序号列表；重复序号自动去重，同一序号只计一次",
+    )
+
+
+class StatPackageMergeIn(BaseModel):
+    package_ids: list[PositiveInt] = Field(
+        ...,
+        min_length=1,
+        description="待合并的包号列表；重复包号自动去重，跨包同一发布序号只计一次",
+    )
+
+
+class StatPackageOut(BaseModel):
+    package_id: int = Field(..., description="包号（1 起稠密，跨实例与重启稳定）")
+    release_ids: list[int] = Field(..., description="包内所含发布序号（升序、已去重）")
+    row_count: int = Field(..., description="两列均有值的有效行数合计")
+    pearson_r: float | None = Field(
+        ...,
+        description="pH 与电导率的 Pearson 相关系数；样本不足两行或任一列恒定时为 null",
+    )
+    created_at: str
 
 
 PublishResult.model_rebuild()

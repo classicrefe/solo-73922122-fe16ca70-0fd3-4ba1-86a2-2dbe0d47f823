@@ -60,3 +60,40 @@ cp "$WORK/day1.csv" "$WORK/tampered.csv"
 printf 'X' >> "$WORK/tampered.csv"
 python3 -m app.verify inclusion \
   --proof "$WORK/inclusion.json" --file "$WORK/tampered.csv" || true
+
+echo "== 9. 统计包：发布含 pH/电导率的 CSV 并制包 =="
+cat > "$WORK/stat1.csv" <<'CSV'
+station,ph,conductivity_us_cm
+ST01,6.5,130
+ST01,7.0,140
+CSV
+cat > "$WORK/stat2.csv" <<'CSV'
+station,ph,conductivity_us_cm
+ST02,7.5,150
+ST02,8.0,160
+ST02,,999
+CSV
+R1=$(curl -s -X POST "$BASE/releases" \
+  -F station_id=ST01 -F sample_date=2026-11-18 -F order_no=ORD-STAT-1 \
+  -F file=@"$WORK/stat1.csv" | python3 -c 'import json,sys; print(json.load(sys.stdin)["release"]["id"])')
+R2=$(curl -s -X POST "$BASE/releases" \
+  -F station_id=ST02 -F sample_date=2026-11-18 -F order_no=ORD-STAT-2 \
+  -F file=@"$WORK/stat2.csv" | python3 -c 'import json,sys; print(json.load(sys.stdin)["release"]["id"])')
+echo "发布序号：$R1, $R2（stat2.csv 第三行 pH 留空，不参与统计）"
+
+PKG1=$(curl -s -X POST "$BASE/stat-packages" \
+  -H 'Content-Type: application/json' -d "{\"release_ids\": [$R1]}")
+echo "$PKG1" | python3 -m json.tool
+PKG1_ID=$(echo "$PKG1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["package_id"])')
+
+PKG2=$(curl -s -X POST "$BASE/stat-packages" \
+  -H 'Content-Type: application/json' -d "{\"release_ids\": [$R1, $R2]}")
+PKG2_ID=$(echo "$PKG2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["package_id"])')
+
+echo "== 10. 合并统计包（$PKG1_ID 与 $PKG2_ID 重叠的序号 $R1 只计一次）=="
+curl -s -X POST "$BASE/stat-packages/merge" \
+  -H 'Content-Type: application/json' \
+  -d "{\"package_ids\": [$PKG1_ID, $PKG2_ID]}" | python3 -m json.tool
+
+echo "== 11. 按包号查询（另一实例端口同样可查，如 8002）=="
+curl -s "$BASE/stat-packages/$PKG2_ID" | python3 -m json.tool

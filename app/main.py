@@ -8,7 +8,11 @@
    - 同键异字节 -> 409 拒绝，记录不可改；
    - 超累计上限 -> 409 拒绝；
 3. 每次发布追加一个检查点（条数 + Merkle 根），只增不改；
-4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用。
+4. 下载与证明只服务已提交记录；启动自检发现缺件则健康检查置为不可用；
+5. 统计包按发布序号读取 UTF-8 CSV 并核对原件摘要，只保留 pH×电导率的
+   充分统计量（整数定标精确求和）；合并按发布序号去重、不重读原件，
+   结果与去重后直接统计逐位一致；缺件/摘要不符/格式错误整次失败，
+   已有包仍可查询、可合并。
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from . import merkle
+from . import stats as stats_mod
 from .config import settings
 from .db import ConflictError, Database
 from .schemas import (
@@ -31,7 +36,11 @@ from .schemas import (
     LeafRecordOut,
     PublishResult,
     ReleaseOut,
+    StatPackageCreateIn,
+    StatPackageMergeIn,
+    StatPackageOut,
 )
+from .stats import CsvFormatError, ReleaseStats
 from .storage import BlobError, BlobStore
 
 blob_store = BlobStore(settings)
@@ -50,10 +59,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="河流水质站日 CSV 发布服务",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "不可改的原件发布、SHA-256 Merkle 检查点、单件纳入证明与检查点追加证明。"
-        "原件字节存共享卷，数据库只存目录与摘要。"
+        "不可改的原件发布、SHA-256 Merkle 检查点、单件纳入证明与检查点追加证明，"
+        "以及 pH×电导率统计包（按发布序号去重、可合并、充分统计量精确汇总）。"
+        "原件字节存共享卷，数据库只存目录、摘要与统计量。"
     ),
     lifespan=lifespan,
 )
@@ -286,6 +296,101 @@ async def append_proof(old_seq: int):
         tree_depth=settings.tree_depth,
         entries=entries,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 统计包（pH × 电导率）
+# --------------------------------------------------------------------------- #
+def _stat_package_out(package: dict) -> StatPackageOut:
+    """把库存充分统计量汇总为对外视图（派生值现算，不冗余落库）。"""
+    items: dict[int, ReleaseStats] = package["items"]
+    total = stats_mod.total_of(items)
+    return StatPackageOut(
+        package_id=package["id"],
+        release_ids=sorted(items),
+        row_count=total.n,
+        pearson_r=stats_mod.pearson_from_stats(total),
+        created_at=package["created_at"],
+    )
+
+
+@app.post(
+    "/stat-packages",
+    response_model=StatPackageOut,
+    status_code=201,
+    summary="制包：按发布序号读取 UTF-8 CSV、核对摘要并汇总 pH×电导率统计量",
+)
+async def create_stat_package(payload: StatPackageCreateIn):
+    # 同一发布序号只计一次；升序固定处理顺序，结果与请求顺序无关。
+    release_ids = sorted(set(payload.release_ids))
+    items: list[tuple[int, ReleaseStats]] = []
+    for release_id in release_ids:
+        record = await run_in_threadpool(database.get_release_by_id, release_id)
+        if record is None:
+            raise HTTPException(404, f"发布序号 {release_id} 不存在，整次制包失败")
+        digest = record["blob_sha256"]
+        data = await run_in_threadpool(blob_store.read_verified, digest)
+        if data is None:
+            raise HTTPException(
+                503,
+                f"发布序号 {release_id} 的原件缺失或摘要不符，整次制包失败",
+            )
+        try:
+            stats = stats_mod.parse_release_csv(data)
+        except CsvFormatError as exc:
+            raise HTTPException(
+                422,
+                f"发布序号 {release_id} 的 CSV 格式错误：{exc}；整次制包失败",
+            )
+        items.append((release_id, stats))
+    # 全部原件核验通过后才落库：任何一步失败都不会留下半个包。
+    package = await run_in_threadpool(database.create_stat_package, items)
+    return _stat_package_out(package)
+
+
+@app.post(
+    "/stat-packages/merge",
+    response_model=StatPackageOut,
+    status_code=201,
+    summary="合并统计包：按发布序号去重后汇总，不重读原件",
+)
+async def merge_stat_packages(payload: StatPackageMergeIn):
+    package_ids = sorted(set(payload.package_ids))
+    union: dict[int, ReleaseStats] = {}
+    for package_id in package_ids:
+        package = await run_in_threadpool(database.get_stat_package, package_id)
+        if package is None:
+            raise HTTPException(404, f"统计包 {package_id} 不存在，整次合并失败")
+        for release_id, stats in package["items"].items():
+            # 同一发布序号只计一次（内容经摘要核验，统计量必然一致）；
+            # 异单同字节因发布序号不同，分别计入。
+            union.setdefault(release_id, stats)
+    package = await run_in_threadpool(
+        database.create_stat_package, sorted(union.items())
+    )
+    return _stat_package_out(package)
+
+
+@app.get(
+    "/stat-packages",
+    response_model=list[StatPackageOut],
+    summary="列出全部统计包",
+)
+async def list_stat_packages():
+    packages = await run_in_threadpool(database.list_stat_packages)
+    return [_stat_package_out(p) for p in packages]
+
+
+@app.get(
+    "/stat-packages/{package_id}",
+    response_model=StatPackageOut,
+    summary="按包号查询统计包",
+)
+async def get_stat_package(package_id: int):
+    package = await run_in_threadpool(database.get_stat_package, package_id)
+    if package is None:
+        raise HTTPException(404, f"不存在包号为 {package_id} 的统计包")
+    return _stat_package_out(package)
 
 
 # --------------------------------------------------------------------------- #

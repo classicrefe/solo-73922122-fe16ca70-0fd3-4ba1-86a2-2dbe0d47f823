@@ -59,6 +59,17 @@ class BlobStore:
     def read(self, digest: str) -> bytes:
         return self._target_path(self._settings.blob_dir, digest).read_bytes()
 
+    def read_verified(self, digest: str) -> bytes | None:
+        """读取原件并核对 SHA-256；缺件或摘要不符返回 None（不抛异常）。"""
+        path = self._target_path(self._settings.blob_dir, digest)
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        if hashlib.sha256(data).hexdigest() != digest:
+            return None
+        return data
+
     @staticmethod
     def _fsync_dir(path: Path) -> None:
         try:
